@@ -33,3 +33,12 @@ def test_create_and_update_order(client):
 
 def test_missing_order(client):
     assert client.get("/api/orders/missing").status_code == 404
+
+
+def test_seeded_express_order_lookup(client):
+    # Regression test for incident on express-1002 (end of month date calculation)
+    response = client.get("/api/orders/express-1002")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["priority"] == "express"
+    assert "estimated_delivery" in data

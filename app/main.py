@@ -1,14 +1,73 @@
+import logging
 import os
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
+# OpenTelemetry imports
+from opentelemetry import metrics, trace
+from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import (
+    ConsoleMetricExporter,
+    PeriodicExportingMetricReader,
+)
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter, SimpleSpanProcessor
+
+# Structured Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s")
+logger = logging.getLogger("order-tracker")
+
+# OpenTelemetry Setup
+resource = Resource.create({"service.name": os.getenv("OTEL_SERVICE_NAME", "order-tracker")})
+
+# Tracing
+tracer_provider = TracerProvider(resource=resource)
+tracer_provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
+
+otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+if otlp_endpoint:
+    try:
+        otlp_trace_exporter = OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True)
+        tracer_provider.add_span_processor(BatchSpanProcessor(otlp_trace_exporter))
+    except Exception as e:
+        logger.warning("Could not initialize OTLP trace exporter: %s", e)
+
+trace.set_tracer_provider(tracer_provider)
+tracer = trace.get_tracer("order-tracker")
+
+# Metrics
+metric_readers = [
+    PeriodicExportingMetricReader(ConsoleMetricExporter(), export_interval_millis=2000)
+]
+if otlp_endpoint:
+    try:
+        otlp_metric_exporter = OTLPMetricExporter(endpoint=otlp_endpoint, insecure=True)
+        metric_readers.append(
+            PeriodicExportingMetricReader(otlp_metric_exporter, export_interval_millis=2000)
+        )
+    except Exception as e:
+        logger.warning("Could not initialize OTLP metric exporter: %s", e)
+
+meter_provider = MeterProvider(resource=resource, metric_readers=metric_readers)
+metrics.set_meter_provider(meter_provider)
+meter = metrics.get_meter("order-tracker")
+
+request_counter = meter.create_counter(
+    "http_requests_total",
+    description="Total count of HTTP requests",
+    unit="1",
+)
 
 DB_PATH = Path(os.getenv("ORDER_DB_PATH", "data/orders.db"))
 STATUSES = {"received", "preparing", "shipped", "delivered"}
@@ -55,7 +114,9 @@ def order_detail(row):
     order = as_dict(row)
     if order["priority"] == "express":
         placed_at = datetime.fromisoformat(order["created_at"])
-        estimated_at = placed_at.replace(day=placed_at.day + 2)
+        # Fix: use timedelta(days=2) instead of replace(day=placed_at.day + 2)
+        # to avoid ValueError when day+2 exceeds the days in that month
+        estimated_at = placed_at + timedelta(days=2)
         order["estimated_delivery"] = estimated_at.date().isoformat()
     return order
 
@@ -77,6 +138,39 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Order Tracker", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def telemetry_middleware(request: Request, call_next):
+    start_time = time.time()
+    route = request.url.path
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    except Exception as exc:
+        status_code = 500
+        raise exc
+    finally:
+        duration_ms = (time.time() - start_time) * 1000
+        attributes = {
+            "route": route,
+            "status_code": str(status_code),
+            "method": request.method,
+        }
+        request_counter.add(1, attributes)
+        current_span = trace.get_current_span()
+        span_context = current_span.get_span_context() if current_span else None
+        trace_id = format(span_context.trace_id, "032x") if span_context and span_context.is_valid else "none"
+        logger.info(
+            "[TELEMETRY] method=%s route=%s status=%d duration=%.2fms trace_id=%s metric=http_requests_total",
+            request.method,
+            route,
+            status_code,
+            duration_ms,
+            trace_id,
+        )
 
 
 @app.get("/")
